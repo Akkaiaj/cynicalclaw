@@ -1,0 +1,29 @@
+{
+  "name": "cynicalclaw",
+  "version": "1.0.0",
+  "description": "Your personal AI assistant with existential dread",
+  "private": true,
+  "scripts": {
+    "install:all": "cd gateway && npm install && cd ../web-ui && npm install",
+    "dev": "concurrently \"cd gateway && npm run dev\" \"cd web-ui && npm start\"",
+    "build": "cd gateway && npm run build && cd ../web-ui && npm run build",
+    "start": "cd gateway && npm start",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/cors": "^2.8.19",
+    "@types/dockerode": "^4.0.1",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.2.0",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^8.54.0",
+    "@typescript-eslint/parser": "^8.54.0",
+    "concurrently": "^8.2.2",
+    "eslint": "^9.39.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  }
+}
