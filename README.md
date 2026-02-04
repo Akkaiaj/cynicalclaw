@@ -1,4 +1,4 @@
-# 🦞 CynicalClaw
+# 🦇 CynicalClaw
 
 Your personal AI assistant with multi-model support, dark humor, and existential dread.
 
