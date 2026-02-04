@@ -2,266 +2,285 @@ import WebSocket from 'ws';
 import { CynicalModelRouter } from '../models/Router';
 import { SkillRegistry } from '../skills/SkillRegistry';
 import { MoltBook } from '../memory/MoltBook';
+import { AgentLoop } from '../agent/AgentLoop';
+import { ToolRouter } from '../agent/ToolRouter';
+import { PersonalityManager, PersonalityMode } from '../personality/PersonalityManager';
+import { MemoryCompressor } from '../memory/MemoryCompressor';
 import { WSMessage, WSResponse, Message } from '../types';
 import { logger } from '../utils/logger';
-import { ChatMessageSchema, MemorySearchSchema } from '../schemas';
+
+interface ExtendedWSMessage extends WSMessage {
+  sessionId?: string;
+  mode?: string;
+  userId?: string;
+}
 
 export class WebSocketHandler {
   private router: CynicalModelRouter;
   private skills: SkillRegistry;
   private moltbook: MoltBook;
+  private agentLoop: AgentLoop;
+  private toolRouter: ToolRouter;
+  private personalityManager: PersonalityManager;
+  private memoryCompressor: MemoryCompressor;
   private clients: Map<string, WebSocket> = new Map();
   private sessions: Map<string, Message[]> = new Map();
+  private userSessions: Map<string, string> = new Map(); // userId -> sessionId
 
   constructor() {
     this.router = new CynicalModelRouter();
+    this.skills = new SkillRegistry('./skills');
     this.moltbook = new MoltBook(this.router);
-    this.skills = new SkillRegistry();
     
+    // Initialize agent components
+    this.agentLoop = new AgentLoop(this.router, this.skills, this.moltbook);
+    this.toolRouter = new ToolRouter(this.router, this.skills);
+    this.personalityManager = new PersonalityManager(this.router);
+    this.memoryCompressor = new MemoryCompressor(this.router);
+
+    // Load skills and start periodic compression
     this.skills.loadSkills().catch(err => {
       logger.error(`Failed to load skills: ${err.message}`);
     });
-    
+
+    // Periodic compression every 6 hours
     setInterval(() => {
-      const oneHourAgo = Date.now() - (60 * 60 * 1000);
-      for (const [sid, messages] of this.sessions) {
-        const lastMsg = messages[messages.length - 1];
-        if (lastMsg && new Date(lastMsg.timestamp).getTime() < oneHourAgo) {
-          this.sessions.delete(sid);
-          logger.log(`Cleaned up expired session: ${sid}`);
-        }
-      }
-    }, 60 * 60 * 1000);
+      this.memoryCompressor.periodicCompression(7);
+    }, 6 * 60 * 60 * 1000);
+
+    logger.log('🧬 WebSocketHandler initialized with Agent Loop capabilities');
   }
 
-  handleConnection(ws: WebSocket, clientId: string) {
+  handleConnection(ws: WebSocket, clientId: string): void {
     this.clients.set(clientId, ws);
-    logger.log(`Client ${clientId} connected. Welcome to the digital abyss.`);
-
+    this.sessions.set(clientId, []);
+    
+    // Send welcome with available modes
     this.send(ws, {
-      type: 'chat_response',
-      id: this.generateId(),
-      content: 'Connected to CynicalClaw. Abandon hope all ye who enter here. 🦞',
-      timestamp: new Date().toISOString()
+      type: 'connected',
+      content: '🦇 CynicalClaw Agent initialized',
+      timestamp: new Date().toISOString(),
+      metadata: {
+        clientId,
+        availableModes: this.personalityManager.listModes(),
+        commands: ['/mode <name>', '/compress', '/status']
+      }
     });
 
-    ws.on('message', async (data) => {
+    logger.log(`🧬 Agent-capable client connected: ${clientId}`);
+
+    ws.on('message', async (data: string) => {
       try {
-        const msg: WSMessage = JSON.parse(data.toString());
-        await this.handleMessage(ws, msg, clientId);
-      } catch (error: any) {
-        this.send(ws, {
-          type: 'error',
-          id: this.generateId(),
-          error: 'Invalid message format. Did you send JSON or just mash the keyboard?',
-          timestamp: new Date().toISOString()
-        });
+        const msg: ExtendedWSMessage = JSON.parse(data);
+        await this.handleMessage(ws, clientId, msg);
+      } catch (err) {
+        this.sendError(ws, 'Invalid JSON format');
       }
     });
 
     ws.on('close', () => {
       this.clients.delete(clientId);
-      logger.log(`Client ${clientId} disconnected. They always leave.`);
-    });
-
-    ws.on('error', (error) => {
-      logger.error(`WebSocket error for ${clientId}: ${error.message}`);
+      // Don't delete session immediately - allow reconnection
+      setTimeout(() => {
+        if (!this.clients.has(clientId)) {
+          this.sessions.delete(clientId);
+        }
+      }, 5 * 60 * 1000); // 5 min grace period
+      logger.log(`Client disconnected: ${clientId}`);
     });
   }
 
-  private async handleMessage(ws: WebSocket, msg: WSMessage, clientId: string) {
-    switch (msg.type) {
-      case 'chat':
-        await this.handleChat(ws, msg, clientId);
-        break;
-      case 'tool_call':
-        await this.handleToolCall(ws, msg);
-        break;
-      case 'memory_search':
-        await this.handleMemorySearch(ws, msg);
-        break;
-      case 'ping':
-        this.send(ws, { type: 'pong', id: msg.id, timestamp: new Date().toISOString() });
-        break;
-      default:
-        this.send(ws, {
-          type: 'error',
-          id: msg.id,
-          error: `Unknown message type: ${msg.type}. Try 'chat' or 'tool_call'.`,
-          timestamp: new Date().toISOString()
-        });
+  private async handleMessage(
+    ws: WebSocket, 
+    clientId: string, 
+    msg: ExtendedWSMessage
+  ): Promise<void> {
+    const session = this.sessions.get(clientId) || [];
+    const userId = msg.userId || clientId;
+
+    // Command handling
+    if (typeof msg.content === 'string' && msg.content.startsWith('/')) {
+      await this.handleCommand(ws, clientId, msg);
+      return;
     }
-  }
 
-  private async handleChat(ws: WebSocket, msg: WSMessage, clientId: string) {
-    try {
-      const validated = ChatMessageSchema.parse(msg.payload);
-      const { content, complexity, budget, personality, sessionId, useTools } = validated;
-      
-      const sid = sessionId || this.generateId();
-      let history = this.sessions.get(sid) || [];
-      
-      const userMsg: Message = {
-        id: this.generateId(),
-        content,
+    // Auto-route to check if tool needed
+    this.send(ws, {
+      type: 'thinking',
+      content: 'Analyzing request...',
+      timestamp: new Date().toISOString()
+    });
+
+    const routing = await this.toolRouter.route(msg.payload?.content || msg.content);
+    
+    let response: string;
+    let usedAgentLoop = false;
+
+    if (routing && routing.confidence > 0.6) {
+      // High confidence tool use - run agent loop
+      usedAgentLoop = true;
+      this.send(ws, {
+        type: 'tool_selected',
+        content: `Selected tool: ${routing.tool}`,
+        metadata: { reasoning: routing.reasoning, confidence: routing.confidence },
+        timestamp: new Date().toISOString()
+      });
+
+      response = await this.agentLoop.run(msg.payload?.content || msg.content, {
+        preselectedTool: routing.tool,
+        preselectedArgs: routing.args,
+        sessionId: msg.sessionId || clientId,
+        userId
+      });
+
+    } else {
+      // Direct response with personality
+      const userMessage: Message = {
+        id: `msg-${Date.now()}`,
+        content: msg.payload?.content || msg.content,
         role: 'user',
         timestamp: new Date().toISOString()
       };
-      history.push(userMsg);
+      session.push(userMessage);
+
+      const effectiveMode = msg.mode 
+        ? (msg.mode as PersonalityMode) 
+        : this.personalityManager.getEffectiveMode(userId, clientId);
+
+      response = await this.personalityManager.generateWithPersonality(
+        session,
+        effectiveMode,
+        userId,
+        clientId
+      );
+    }
+
+    // Store and send response
+    const assistantMessage: Message = {
+      id: `resp-${Date.now()}`,
+      content: response,
+      role: 'assistant',
+      timestamp: new Date().toISOString(),
+      metadata: { agentLoop: usedAgentLoop }
+    };
+
+    if (!usedAgentLoop) {
+      session.push(assistantMessage);
+      this.sessions.set(clientId, session);
+    }
+
+    this.send(ws, {
+      type: 'response',
+      content: response,
+      timestamp: new Date().toISOString(),
+      metadata: {
+        mode: this.personalityManager.getEffectiveMode(userId, clientId),
+        agentLoop: usedAgentLoop,
+        sessionSize: session.length
+      }
+    });
+
+    // Background memory storage
+    try {
+      await this.moltbook.remember?.(userId, msg.payload?.content || msg.content, response);
+    } catch (err) {
+      logger.error('Failed to store memory:', err);
+    }
+  }
+
+  private async handleCommand(
+    ws: WebSocket, 
+    clientId: string, 
+    msg: ExtendedWSMessage
+  ): Promise<void> {
+    const userId = msg.userId || clientId;
+    const content = msg.payload?.content || msg.content;
+
+    if (content.startsWith('/mode ')) {
+      const { mode } = this.personalityManager.parseModeCommand(content);
       
+      if (mode) {
+        this.personalityManager.setUserMode(userId, mode);
+        const config = this.personalityManager.getConfig(mode);
+        
+        this.send(ws, {
+          type: 'mode_changed',
+          content: `Switched to ${mode} mode ${config.icon}`,
+          metadata: { 
+            mode,
+            description: config.systemPrompt.slice(0, 100) + '...'
+          },
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        this.sendError(ws, `Invalid mode. Available: ${this.personalityManager.listModes().map(m => m.id).join(', ')}`);
+      }
+      return;
+    }
+
+    if (content === '/compress') {
       this.send(ws, {
-        type: 'chat_response',
-        id: msg.id,
-        content: 'Consulting the void...',
-        metadata: { loading: true },
+        type: 'status',
+        content: 'Starting memory compression...',
         timestamp: new Date().toISOString()
       });
 
-      let responseContent = '';
-      
-      if (useTools) {
-        const toolCall = this.detectToolCall(content);
-        if (toolCall) {
-          responseContent = await this.skills.executeTool(toolCall.tool, toolCall.args);
-        } else {
-          responseContent = await this.generateResponse(history, complexity, budget, personality, ws, msg.id);
-        }
-      } else {
-        responseContent = await this.generateResponse(history, complexity, budget, personality, ws, msg.id);
-      }
-      
-      const assistantMsg: Message = {
-        id: this.generateId(),
-        content: responseContent,
-        role: 'assistant',
-        timestamp: new Date().toISOString(),
-        metadata: {
-          model: this.router.getCurrentModel().id,
-          mood: personality || 'sarcastic'
-        }
-      };
-      history.push(assistantMsg);
-      this.sessions.set(sid, history);
-      
-      await this.moltbook.writeConversationSummary(content, responseContent);
+      const compressed = await this.memoryCompressor.compressSession(clientId, true);
       
       this.send(ws, {
-        type: 'chat_response',
-        id: msg.id,
-        content: responseContent,
+        type: 'compression_complete',
+        content: compressed 
+          ? `Session compressed. Summary:\n${compressed.slice(0, 200)}...`
+          : 'Nothing to compress',
+        timestamp: new Date().toISOString()
+      });
+      return;
+    }
+
+    if (content === '/status') {
+      const session = this.sessions.get(clientId) || [];
+      const mode = this.personalityManager.getEffectiveMode(userId, clientId);
+      
+      this.send(ws, {
+        type: 'status',
+        content: `Status: ${mode} mode | Session: ${session.length} messages`,
         metadata: {
-          sessionId: sid,
-          model: this.router.getCurrentModel().id,
-          tokens: this.estimateTokens(content + responseContent)
+          mode,
+          messageCount: session.length,
+          tools: this.skills.getToolDefinitions().map(t => t.name)
         },
         timestamp: new Date().toISOString()
       });
-      
-    } catch (error: any) {
-      this.send(ws, {
-        type: 'error',
-        id: msg.id,
-        error: error.message,
-        timestamp: new Date().toISOString()
-      });
+      return;
     }
+
+    this.sendError(ws, 'Unknown command');
   }
 
-  private async generateResponse(
-    history: Message[], 
-    complexity: string, 
-    budget: string, 
-    personality: string | undefined,
-    ws: WebSocket,
-    msgId: string
-  ): Promise<string> {
-    let fullResponse = '';
-    
-    await this.router.routeRequest(
-      history,
-      complexity as any,
-      budget as any,
-      personality as any,
-      (chunk) => {
-        fullResponse += chunk;
-        this.send(ws, {
-          type: 'chat_response',
-          id: msgId,
-          content: chunk,
-          metadata: { streaming: true },
-          timestamp: new Date().toISOString()
-        });
-      }
-    );
-    
-    return fullResponse;
-  }
-
-  private async handleToolCall(ws: WebSocket, msg: WSMessage) {
-    try {
-      const { tool, args } = msg.payload;
-      const result = await this.skills.executeTool(tool, args);
-      
-      this.send(ws, {
-        type: 'tool_result',
-        id: msg.id,
-        content: result,
-        timestamp: new Date().toISOString()
-      });
-    } catch (error: any) {
-      this.send(ws, {
-        type: 'error',
-        id: msg.id,
-        error: `Tool execution failed: ${error.message}`,
-        timestamp: new Date().toISOString()
-      });
-    }
-  }
-
-  private async handleMemorySearch(ws: WebSocket, msg: WSMessage) {
-    try {
-      const { query, mode, limit } = MemorySearchSchema.parse(msg.payload);
-      const results = await this.moltbook.searchMemories(query, limit);
-      
-      this.send(ws, {
-        type: 'memory_result',
-        id: msg.id,
-        content: results,
-        timestamp: new Date().toISOString()
-      });
-    } catch (error: any) {
-      this.send(ws, {
-        type: 'error',
-        id: msg.id,
-        error: error.message,
-        timestamp: new Date().toISOString()
-      });
-    }
-  }
-
-  private detectToolCall(content: string): { tool: string; args: any } | null {
-    if (content.includes('read file')) {
-      const match = content.match(/read file\s+(\S+)/);
-      if (match) return { tool: 'read_file', args: { path: match[1] } };
-    }
-    if (content.includes('list directory')) {
-      const match = content.match(/list directory\s+(\S+)/);
-      if (match) return { tool: 'list_directory', args: { path: match[1] } };
-    }
-    return null;
-  }
-
-  private estimateTokens(text: string): number {
-    return Math.ceil(text.length / 4);
-  }
-
-  private generateId(): string {
-    return Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-
-  private send(ws: WebSocket, response: WSResponse) {
+  private send(ws: WebSocket, data: WSResponse): void {
     if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(response));
+      ws.send(JSON.stringify(data));
     }
+  }
+
+  private sendError(ws: WebSocket, message: string): void {
+    this.send(ws, {
+      type: 'error',
+      content: message,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // Public API methods
+  async executeSkill(skillName: string, args: any): Promise<string> {
+    return this.skills.executeTool(skillName, args);
+  }
+
+  getPersonalityModes() {
+    return this.personalityManager.listModes();
+  }
+
+  getToolDefinitions() {
+    return this.skills.getToolDefinitions();
   }
 }
