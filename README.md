@@ -108,6 +108,10 @@ Commands
 | `/compress`    | Force memory compression            |
 | `/status`      | Show current mode and session stats |
 
+## 📜 License
+
+CynicalClaw is released under the MIT License.
+
 🏗️ Project Structure
 
 cynicalclaw/
@@ -204,7 +208,11 @@ export default class MySkill extends BaseSkill {
 
 
 
-
+/*
+ * CynicalClaw
+ * Copyright (c) 2026 Akkaiaj
+ * Licensed under the MIT License
+ */
 
 
 
